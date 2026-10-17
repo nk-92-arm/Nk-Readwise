@@ -78,7 +78,9 @@ def running_lines(chunks):
     c = Counter()
     for ch in chunks:
         c.update({norm_line(l) for l in ch["text"].splitlines() if 0 < len(norm_line(l)) < 90})
-    return {l for l, n in c.items() if n >= max(3, 0.4 * len(chunks))}
+    pages = len(chunks)
+    return {l for l, n in c.items()
+            if n >= max(3, 0.4 * pages) or (len(l) < 40 and n >= max(3, 0.25 * pages))}
 
 def clean_md(text, drop):
     text = re.sub(r"<!-- Start of picture text -->.*?<!-- End of picture text -->", "", text, flags=re.S)
@@ -128,6 +130,76 @@ def demote_headings(h, top=2):
         return f"<{m.group(1)}h{lvl}"
     return re.sub(r"<(/?)h([1-6])", rep, h)
 
+def page_title(page):
+    """Slide title = the largest *wordy* text near the top of the page (by font size).
+    Big KPI numbers ("2-3x", "~20-50%") or step labels ("1 2 3") are skipped."""
+    spans = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                t = sp["text"].strip()
+                if t and sp["bbox"][1] < page.rect.height * 0.6:
+                    spans.append((round(sp["size"], 1), sp["bbox"][1], sp["bbox"][0], t))
+    if not spans:
+        return None
+    body = Counter(x[0] for x in spans).most_common(1)[0][0]
+    for size in sorted({x[0] for x in spans}, reverse=True):
+        if size < 14 and size < body * 1.25:
+            return None
+        group = [x for x in spans if abs(x[0] - size) <= 0.6]
+        if min(x[1] for x in group) > page.rect.height * 0.35:     # must start in the top third
+            continue
+        group = sorted(group, key=lambda x: (round(x[1] / 4), x[2]))
+        t = re.sub(r"\s+", " ", " ".join(x[3] for x in group)).strip()
+        t = re.sub(r"(\w)- (\w)", r"\1-\2", t)
+        if len(re.findall(r"[A-Za-zÄÖÜäöüß]{3,}", t)) >= 3 and len(t) < 220:
+            return t
+    return None
+
+def strip_title_from_md(md, title):
+    """Remove the line(s) of md that repeat the title (they may carry extra merged text)."""
+    key = norm_line(title)[:40]
+    lines = md.splitlines()
+    for idx, l in enumerate(lines):
+        n = norm_line(l)
+        if key and n.startswith(key):
+            rest = n[len(norm_line(title)):].strip()
+            if len(rest) < 3:
+                del lines[idx]
+            break
+    return "\n".join(lines)
+
+def merge_continuation_rows(md):
+    """Tables from slides often split one wrapped cell into several rows.
+    Merge a row into the previous one when most of its cells continue lowercase text."""
+    out, block = [], []
+    def flush():
+        if not block:
+            return
+        rows = [[c.strip() for c in l.strip()[1:-1].split("|")] for l in block]
+        if len(rows) < 3:
+            out.extend(block); block.clear(); return
+        head, sep, body = rows[0], rows[1], rows[2:]
+        merged = []
+        for r in body:
+            cells = [re.sub(r"[*_<>br/]+", "", c).strip() for c in r]
+            filled = [c for c in cells if c]
+            lower = sum(c[:1].islower() for c in filled)
+            if merged and filled and lower >= max(1, 0.6 * len(filled)) and len(r) == len(merged[-1]):
+                merged[-1] = [(a + " " + b).strip() for a, b in zip(merged[-1], r)]
+            else:
+                merged.append(r)
+        for r in [head, sep] + merged:
+            out.append("|" + "|".join(r) + "|")
+        block.clear()
+    for l in md.splitlines():
+        if l.strip().startswith("|"):
+            block.append(l)
+        else:
+            flush(); out.append(l)
+    flush()
+    return "\n".join(out)
+
 def first_heading(md):
     for l in md.splitlines():
         s = l.strip()
@@ -163,9 +235,14 @@ def build_slides(doc, path, args):
         no_text = len(re.sub(r"\W", "", md)) < 3
         if no_text and (i == len(chunks) - 1 or (not page.get_images() and not page.get_drawings())):
             continue   # blank page or logo-only closing slide
-        title, title_line = first_heading(md)
-        if title_line:
-            md = md.replace(title_line, "", 1)
+        title = page_title(page)
+        if title:
+            md = strip_title_from_md(md, title)
+        else:
+            title, title_line = first_heading(md)
+            if title_line:
+                md = md.replace(title_line, "", 1)
+        md = merge_continuation_rows(md)
         heading = title or f"Page {i + 1}"
         parts.append(f"<section>\n<h2>{i + 1}. {esc(heading)}</h2>")
         if not args.text_only:
