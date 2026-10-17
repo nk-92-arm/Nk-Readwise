@@ -214,6 +214,78 @@ def first_heading(md):
     return None, None
 
 
+# ---------------------------------------------------------------- OCR for image-only slides
+def has_tesseract():
+    try:
+        return subprocess.run(["tesseract", "--version"], capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+def ocr_page(page, lang="eng"):
+    """OCR an image-only page. Dark backgrounds are inverted first (much better accuracy
+    on light-on-dark slides). Returns (title, [paragraph dicts]) using Tesseract layout data."""
+    import csv
+    from PIL import Image, ImageOps, ImageStat
+    zoom = max(1.0, 2600 / page.rect.width)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    im = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+    if ImageStat.Stat(im).mean[0] < 110:
+        im = ImageOps.invert(im)
+    im = ImageOps.autocontrast(im)
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    r = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "3", "-l", lang, "tsv"],
+                       input=buf.getvalue(), capture_output=True)
+    rows = list(csv.DictReader(io.StringIO(r.stdout.decode(errors="replace")), delimiter="\t"))
+    paras, order = {}, []
+    for w in rows:
+        if w.get("level") != "5" or not (w.get("text") or "").strip():
+            continue
+        if float(w.get("conf") or -1) < 55:
+            continue
+        k = (int(w["block_num"]), int(w["par_num"]))
+        if k not in paras:
+            paras[k] = []; order.append(k)
+        paras[k].append(w)
+    H = im.height
+    out = []
+    for k in order:
+        ws = paras[k]
+        text = " ".join(w["text"] for w in ws)
+        text = re.sub(r"\s*[|=]+\s*(?=\S)", " · ", text).strip(" ·|=-_~—")
+        text = re.sub(r"\s+[^\w\s(\"'“‘%$€]{1,2}(?=\s|$)", "", text).strip()
+        text = re.sub(r"^[^\w(\"'“‘$€]+\s*", "", text)                 # leading "© ", "[ ", "\ "
+        words = re.findall(r"[A-Za-zÄÖÜäöüß]{2,}", text)
+        if not re.search(r"[A-Za-zÄÖÜäöüß]{3,}|\d", text) or len("".join(words)) < 0.5 * len(re.sub(r"\W", "", text)):
+            continue                                              # mostly symbols / OCR noise
+        top = min(int(w["top"]) for w in ws)
+        if top > H * 0.93 and len(text) < 40:
+            continue                                              # footer / watermark
+        hs = sorted(int(w["height"]) for w in ws)
+        out.append(dict(text=text, h=hs[len(hs) // 2], top=top, words=len(words)))
+    if not out:
+        return None, []
+    body_h = sorted(p["h"] for p in out)[len(out) // 2]
+    cands = [p for p in out if p["top"] < H * 0.45 and p["words"] >= 3 and p["h"] >= body_h * 1.25]
+    title = max(cands, key=lambda p: p["h"]) if cands else None
+    if not title:   # fallback: first prominent multi-word line near the top
+        title = next((p for p in sorted(out, key=lambda p: p["top"])
+                      if p["top"] < H * 0.3 and p["words"] >= 4 and p["h"] >= body_h), None)
+    if title:
+        out.remove(title)
+    for p in out:
+        p["kind"] = "kpi" if p["h"] >= body_h * 2 and p["words"] <= 3 else \
+                    "h" if p["h"] >= body_h * 1.25 and len(p["text"]) < 90 else "p"
+    return (title["text"] if title else None), out
+
+def ocr_html(paras):
+    h = []
+    for p in paras:
+        t = esc(p["text"])
+        h.append(f"<p><strong>{t}</strong></p>" if p["kind"] == "kpi" else
+                 f"<h4>{t}</h4>" if p["kind"] == "h" else f"<p>{t}</p>")
+    return "\n".join(h)
+
+
 # ---------------------------------------------------------------- mode detection
 def detect_mode(doc):
     n = min(doc.page_count, 8)
@@ -235,6 +307,19 @@ def build_slides(doc, path, args):
         no_text = len(re.sub(r"\W", "", md)) < 3
         if no_text and (i == len(chunks) - 1 or (not page.get_images() and not page.get_drawings())):
             continue   # blank page or logo-only closing slide
+        image_only = len(page.get_text().strip()) < 20
+        if image_only and args.ocr:
+            title, ocr_paras = ocr_page(page, args.ocr_lang)
+            if not title and i == 0:          # stylised cover text rarely OCRs well
+                title, ocr_paras = args.doc_title, []
+            heading = title or f"Page {i + 1}"
+            parts.append(f"<section>\n<h2>{i + 1}. {esc(heading)}</h2>")
+            if not args.text_only:
+                parts.append(f'<figure><img src="{render_page(page, args.max_width, args.quality, args.sink)}" '
+                             f'alt="Slide {i + 1}: {esc(heading)}"></figure>')
+            parts.append(ocr_html(ocr_paras))
+            parts.append("</section>\n<hr>")
+            continue
         title = page_title(page)
         if title:
             md = strip_title_from_md(md, title)
@@ -330,8 +415,11 @@ def main():
     ap.add_argument("--assets-dir", help="write images here instead of embedding (e.g. <repo>/assets)")
     ap.add_argument("--assets-base-url", help="public URL that --assets-dir is served at")
     ap.add_argument("--doc-id", help="subfolder name for this document's images (default: file hash)")
+    ap.add_argument("--no-ocr", action="store_true", help="skip OCR for image-only pages")
+    ap.add_argument("--ocr-lang", default="eng", help="Tesseract language(s), e.g. eng+deu")
     ap.add_argument("--token")
     args = ap.parse_args()
+    args.ocr = not args.no_ocr and has_tesseract()
     if bool(args.assets_dir) != bool(args.assets_base_url):
         sys.exit("--assets-dir and --assets-base-url go together")
 
@@ -343,6 +431,7 @@ def main():
     title = args.title or meta.get("title") or os.path.splitext(name)[0]
     author = args.author or meta.get("author") or None
     digest = hashlib.sha1(open(path, "rb").read()).hexdigest()[:16]
+    args.doc_title = title
     args.sink = ImageSink(args.assets_dir, args.assets_base_url, args.doc_id or digest)
 
     def build():
