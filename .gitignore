@@ -1,5 +1,5 @@
 *.pdf
+!pdfs/*.pdf
 *.reader.html
 __pycache__/
 .DS_Store
-!assets/**
