@@ -198,10 +198,10 @@ def build_document(doc, path, args):
     return demote_headings(h, top=1)
 
 def wrap(title, author, body_html, source_name):
+    # Reader shows the document title itself; no <title>/<h1> here, or it appears twice.
     by = f" · {esc(author)}" if author else ""
-    return (f"<html><head><meta charset='utf-8'><title>{esc(title)}</title></head><body>"
-            f"<h1>{esc(title)}</h1>\n<p><em>Converted from {esc(source_name)}{by}</em></p>\n"
-            f"{body_html}</body></html>")
+    return (f"<html><head><meta charset='utf-8'></head><body>"
+            f"<p><em>Converted from {esc(source_name)}{by}</em></p>\n{body_html}</body></html>")
 
 
 # ---------------------------------------------------------------- token + push
