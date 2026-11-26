@@ -77,6 +77,7 @@ Niklas also wants the original, native PDF in Reader for page-faithful viewing.
   - `category`: `pdf`
   - the same title with " (PDF)" appended
   - the same tags
+  - Once Reader shows the PDF document (it stores its own copy), remove `pdfs/<doc-id>.pdf` again with `git rm`, commit and push. The repo is public; the full report should not stay downloadable from it.
 - **Confidential, or Route A:** there is no private upload API for PDFs. Tell Niklas to drag the file into Reader (read.readwise.io → Upload) or forward it to his Reader email address.
 
 ## 4. Verify and report
